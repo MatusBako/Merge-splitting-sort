@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <mpi.h>
 #include <fstream>
+#include <unistd.h>
 
 //#define DEBUG
 
@@ -10,6 +11,25 @@
 
 #define INPUT_ERR 	1
 #define ARG_ERR 	2
+
+bool isTimedRun(int argc, char** argv)
+{
+    bool timed_run = false;
+    int opt;
+
+    while ((opt = getopt(argc, argv, "t")) != -1) {
+        switch (opt) {
+            case 't':
+                timed_run = true;
+                break;
+            case '?':
+                std::cerr << "Unknown option: '" << char(optopt) << "'!" << std::endl;
+                break;
+        }
+    }
+
+    return timed_run;
+}
 
 /** \brief Determines if process is sorting during given iteration.
   * \param odd_iteration Determines if current iteration is odd.
@@ -42,7 +62,7 @@ bool isNodeSorting(bool odd_iteration, int proc_cnt, int rank)
 }
 
 /**
- * \brief Function prints numbers of process in order of processes.
+ * \brief Function prints numbers of process in order of processes for debug purposses.
  * \param number Vector of numbers.
  * \param rank Rank of process.
  * \param proc_count Total number of processes.
@@ -100,23 +120,20 @@ std::vector<unsigned char> getNumbers(const char* filepath)
 	else
 	{
 		std::cerr << "Error occurred while opening input file." << std::endl;
-		exit(INPUT_ERR);
+		MPI_Abort(MPI_COMM_WORLD, INPUT_ERR);
 	}
 }
 
 int main(int argc, char **argv)
-{  
-	if (argc != 2)
-	{
-		std::cerr << "Error: The only argument is path to input file." << std::endl;
-		MPI_Abort(MPI_COMM_WORLD, ARG_ERR);
-	}
+{
+	MPI_Init(&argc, &argv);
 
-	MPI_Init(&argc, &argv);  
-
-	std::vector<unsigned char> numbers;
+	unsigned int fill_count = 0;
 	int rank, proc_count, chunk_size;
-	MPI_Status status;
+    double start_time, end_time;
+    bool timed_run;
+    std::vector<unsigned char> numbers;
+    MPI_Status status;
 	MPI_Request request;
 
 	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -134,12 +151,27 @@ int main(int argc, char **argv)
 
 	if (rank == MASTER_RANK)
 	{
+		if (argc < 2 || argc > 3)
+		{
+			std::cerr << argc << "Error: The only argument is path to input file." << std::endl;
+			MPI_Abort(MPI_COMM_WORLD, ARG_ERR);
+		}
+
+		if (argc == 3 && strcmp(argv[2],"-t"))
+		{
+			std::cerr << "Error: Invalid third argument." << std::endl;
+			MPI_Abort(MPI_COMM_WORLD, ARG_ERR);
+		}
+
 		// load input
 		numbers = getNumbers(argv[1]);
 
-		if (numbers.size() % proc_count != 0)
+		// getopt() destroys arguments!!
+        timed_run = isTimedRun(argc, argv);
+
+		if (numbers.size() < proc_count)
 		{
-			std::cerr << "Input length is not divisible by number of processes." << std::endl;
+			std::cerr << "Length of input vector is less than number of processes!" << std::endl;
 			MPI_Abort(MPI_COMM_WORLD, INPUT_ERR);
 		}
 
@@ -148,9 +180,19 @@ int main(int argc, char **argv)
 		#endif
 
         // print input
-		for (unsigned char &number : numbers)
-            std::cout << (int) number << " ";
-		std::cout << std::endl;
+        if (!timed_run)
+        {
+            for (unsigned char &number : numbers)
+                std::cout << (int) number << " ";
+            std::cout << std::endl;
+        }
+
+		if (numbers.size() % proc_count != 0)
+		{
+			fill_count = proc_count - (numbers.size() % proc_count);
+			std::vector<unsigned char> fill (fill_count, 255);
+			numbers.insert(numbers.end(), fill.begin(), fill.end());
+		}
 
 		chunk_size = static_cast<int>(numbers.size() / proc_count);
 
@@ -162,6 +204,9 @@ int main(int argc, char **argv)
 		MPI_Type_commit(&number_chunk);
 
 		numbers.resize(chunk_size * 2);
+
+        if (timed_run)
+            start_time = MPI_Wtime();
 	}
 	else
 	{
@@ -170,7 +215,7 @@ int main(int argc, char **argv)
 
 		numbers = std::vector<unsigned char>(chunk_size * 2);
 
-		// create type
+		// create data type
 		MPI_Type_contiguous(chunk_size, MPI_UNSIGNED_CHAR, &number_chunk);
 		MPI_Type_commit(&number_chunk);
 	}
@@ -184,28 +229,47 @@ int main(int argc, char **argv)
 
 	MPI_Comm current_comm = even_comm;
 
-	for (int iter_cnt = 0; iter_cnt < proc_count + proc_count % 2; iter_cnt++)
+    // odd process count => two more iterations
+	for (int iter_cnt = 0; iter_cnt < proc_count + 2* (proc_count % 2); iter_cnt++)
 	{
+        #ifdef DEBUG
+            MPI_Barrier(MPI_COMM_WORLD);
+            if (!rank)
+            {
+                std::cout << "Iteration " << iter_cnt + 1 << std::endl;
+                fflush(stdout);
+            }
+        #endif
+
 		if (isNodeSorting(iter_cnt % 2, proc_count, rank))
-			if ((rank + iter_cnt)% 2)
-			{
-				MPI_Isend(&numbers[0], 1, number_chunk, rank - 1, DEFAULT_TAG, current_comm, &request);
-				MPI_Irecv(&numbers[0], 1, number_chunk, rank - 1, DEFAULT_TAG, current_comm, &request);
-			}
-			else 
-			{
-				MPI_Irecv(&numbers[chunk_size], 1, number_chunk, rank + 1, DEFAULT_TAG, current_comm, &request);
-				MPI_Wait(&request, &status);
+        {
+            if ((rank + iter_cnt) % 2)
+            {
+                #ifdef DEBUG
+                    std::cout << "I'm rank " << rank << ", sending vector and recieving sorted." << std::endl;
+                    fflush(stdout);
+                #endif
 
-				std::sort (numbers.begin(), numbers.end());
+                MPI_Isend(&numbers[0], 1, number_chunk, rank - 1, DEFAULT_TAG, current_comm, &request);
+                MPI_Irecv(&numbers[0], 1, number_chunk, rank - 1, DEFAULT_TAG, current_comm, &request);
+            }
+            else
+            {
+                #ifdef DEBUG
+                    std::cout << "I'm rank " << rank << ", waiting for vector and sorting." << std::endl;
+                    fflush(stdout);
+                #endif
 
-				MPI_Isend(&numbers[chunk_size], 1, number_chunk, rank + 1, DEFAULT_TAG, current_comm, &request);
-			}
-		
-		MPI_Wait(&request, &status);
+                MPI_Recv(&numbers[chunk_size], 1, number_chunk, rank + 1, DEFAULT_TAG, current_comm, &status);
+                //MPI_Wait(&request, &status);
 
-		// DEBUG: delete after
-		//MPI_Barrier(MPI_COMM_WORLD);
+                std::sort(numbers.begin(), numbers.end());
+
+                MPI_Isend(&numbers[chunk_size], 1, number_chunk, rank + 1, DEFAULT_TAG, current_comm, &request);
+            }
+
+            MPI_Wait(&request, &status);
+        }
 
 		if (current_comm == even_comm)
 			current_comm = odd_comm;
@@ -214,11 +278,10 @@ int main(int argc, char **argv)
 	}
 
     #ifdef DEBUG
+        if (!rank)
+            std::cout << "Sorted numbers: " << std::endl;
         printAllNumbers(numbers, rank, proc_count, chunk_size);
     #endif
-
-
-    //MPI_Barrier(MPI_COMM_WORLD);
 
 	if (rank == MASTER_RANK)
 	{
@@ -227,19 +290,23 @@ int main(int argc, char **argv)
 
 	MPI_Gather(&numbers[0], 1, number_chunk, &numbers[0], 1, number_chunk, MASTER_RANK, MPI_COMM_WORLD);
 
-	//std::cout << "Rank " << rank << " has chunk size " << chunk_size << std::endl;
-
     if (rank == MASTER_RANK)
 	{
-        #ifdef DEBUG
-            std::cout << "Ziskana postupnost: " << std::endl;
-        #endif
-        for (unsigned char &number : numbers)
-            std::cout << (int) number << std::endl;
+        if (timed_run)
+        {
+            end_time = MPI_Wtime();
+            std::cout << end_time - start_time << std::endl;
+        }
+        else
+		{
+			numbers.resize(numbers.size() - fill_count);
+			for (unsigned char &number : numbers)
+				std::cout << (int) number << std::endl;
+		}
+
 	}
 
 	MPI_Type_free(&number_chunk);
-
 	MPI_Finalize();
 }
 
